@@ -1,0 +1,108 @@
+from flask import Flask, request, jsonify
+from flask_sqlalchemy import SQLAlchemy
+from werkzeug.security import generate_password_hash
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.feature_extraction.text import TfidfVectorizer
+import json
+
+app = Flask(__name__)
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///ecommerce.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
+
+# Models
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    password = db.Column(db.String(120), nullable=False)
+    purchase_history = db.relationship('Purchase', backref='user', lazy=True)
+
+class Product(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(200), nullable=False)
+    description = db.Column(db.Text, nullable=False)
+    price = db.Column(db.Float, nullable=False)
+    category = db.Column(db.String(100), nullable=False)
+    tags = db.Column(db.String(300))
+
+class Purchase(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    product_id = db.Column(db.Integer, db.ForeignKey('product.id'), nullable=False)
+    quantity = db.Column(db.Integer, nullable=False)
+    purchase_date = db.Column(db.DateTime, default=db.func.current_timestamp())
+
+# Recommendation Engine
+class RecommendationEngine:
+    def __init__(self):
+        self.vectorizer = TfidfVectorizer(stop_words='english')
+        self.product_vectors = None
+        self.product_ids = []
+        
+    def train(self, products):
+        descriptions = [f"{p.name} {p.description} {p.category} {p.tags}" for p in products]
+        self.product_vectors = self.vectorizer.fit_transform(descriptions)
+        self.product_ids = [p.id for p in products]
+        
+    def recommend(self, product_id, top_n=5):
+        try:
+            idx = self.product_ids.index(product_id)
+            product_vector = self.product_vectors[idx]
+            similarities = cosine_similarity(product_vector, self.product_vectors)
+            similar_indices = np.argsort(similarities[0])[-top_n-1:-1][::-1]
+            return [self.product_ids[i] for i in similar_indices]
+        except ValueError:
+            return []
+
+# Initialize recommendation engine
+engine = RecommendationEngine()
+
+@app.before_first_request
+def initialize_data():
+    db.create_all()
+    # Sample data initialization would go here
+    products = Product.query.all()
+    if products:
+        engine.train(products)
+
+# API Endpoints
+@app.route('/api/recommend/<int:product_id>', methods=['GET'])
+def get_recommendations(product_id):
+    recommended_ids = engine.recommend(product_id)
+    recommended_products = Product.query.filter(Product.id.in_(recommended_ids)).all()
+    return jsonify([{
+        'id': p.id,
+        'name': p.name,
+        'price': p.price,
+        'category': p.category
+    } for p in recommended_products])
+
+@app.route('/api/products', methods=['GET'])
+def get_products():
+    products = Product.query.all()
+    return jsonify([{
+        'id': p.id,
+        'name': p.name,
+        'price': p.price,
+        'category': p.category
+    } for p in products])
+
+@app.route('/api/user/<int:user_id>/recommendations', methods=['GET'])
+def get_user_recommendations(user_id):
+    # Get user's last purchased item
+    last_purchase = Purchase.query.filter_by(user_id=user_id).order_by(Purchase.purchase_date.desc()).first()
+    if not last_purchase:
+        return jsonify({"message": "No purchase history found"}), 404
+    
+    recommended_ids = engine.recommend(last_purchase.product_id)
+    recommended_products = Product.query.filter(Product.id.in_(recommended_ids)).all()
+    return jsonify([{
+        'id': p.id,
+        'name': p.name,
+        'price': p.price,
+        'category': p.category
+    } for p in recommended_products])
+
+if __name__ == '__main__':
+    app.run(debug=True)
