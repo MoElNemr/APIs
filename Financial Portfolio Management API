@@ -1,0 +1,223 @@
+from flask import Flask, request, jsonify
+from flask_sqlalchemy import SQLAlchemy
+from werkzeug.security import generate_password_hash, check_password_hash
+import jwt
+from datetime import datetime, timedelta
+from functools import wraps
+import yfinance as yf
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize
+
+app = Flask(__name__)
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///finance.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['SECRET_KEY'] = 'your-finance-secret-key'
+db = SQLAlchemy(app)
+
+# Models
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    password = db.Column(db.String(120), nullable=False)
+    portfolios = db.relationship('Portfolio', backref='user', lazy=True)
+
+class Portfolio(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    name = db.Column(db.String(100), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    assets = db.relationship('PortfolioAsset', backref='portfolio', lazy=True)
+
+class PortfolioAsset(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    portfolio_id = db.Column(db.Integer, db.ForeignKey('portfolio.id'), nullable=False)
+    ticker = db.Column(db.String(20), nullable=False)
+    weight = db.Column(db.Float, nullable=False)
+
+# Auth Decorator
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = request.headers.get('Authorization')
+        if not token:
+            return jsonify({'message': 'Token is missing!'}), 401
+        try:
+            data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
+            current_user = User.query.get(data['user_id'])
+        except:
+            return jsonify({'message': 'Token is invalid!'}), 401
+        return f(current_user, *args, **kwargs)
+    return decorated
+
+# Portfolio Optimization
+class PortfolioOptimizer:
+    def __init__(self):
+        self.historical_data = {}
+        
+    def fetch_data(self, tickers, period='1y'):
+        data = yf.download(tickers, period=period)['Adj Close']
+        returns = data.pct_change().dropna()
+        self.historical_data = {
+            'returns': returns,
+            'cov_matrix': returns.cov(),
+            'mean_returns': returns.mean()
+        }
+        return returns
+    
+    def calculate_portfolio_performance(self, weights):
+        returns = np.sum(self.historical_data['mean_returns'] * weights) * 252
+        volatility = np.sqrt(np.dot(weights.T, np.dot(self.historical_data['cov_matrix'] * 252, weights)))
+        return returns, volatility
+    
+    def optimize_portfolio(self, target_return=None):
+        num_assets = len(self.historical_data['mean_returns'])
+        args = (self.historical_data['mean_returns'], self.historical_data['cov_matrix'])
+        constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
+        bounds = tuple((0, 1) for asset in range(num_assets))
+        
+        if target_return:
+            constraints = (
+                {'type': 'eq', 'fun': lambda x: np.sum(x) - 1},
+                {'type': 'eq', 'fun': lambda x: self.calculate_portfolio_performance(x)[0] - target_return}
+            )
+        
+        result = minimize(
+            self._portfolio_volatility,
+            num_assets * [1. / num_assets],
+            args=args,
+            method='SLSQP',
+            bounds=bounds,
+            constraints=constraints
+        )
+        return result.x
+    
+    def _portfolio_volatility(self, weights, mean_returns, cov_matrix):
+        return self.calculate_portfolio_performance(weights)[1]
+
+optimizer = PortfolioOptimizer()
+
+# API Endpoints
+@app.route('/api/register', methods=['POST'])
+def register():
+    data = request.get_json()
+    hashed_password = generate_password_hash(data['password'], method='sha256')
+    new_user = User(username=data['username'], password=hashed_password)
+    db.session.add(new_user)
+    db.session.commit()
+    return jsonify({'message': 'User created successfully'}), 201
+
+@app.route('/api/login', methods=['POST'])
+def login():
+    auth = request.get_json()
+    user = User.query.filter_by(username=auth['username']).first()
+    if not user or not check_password_hash(user.password, auth['password']):
+        return jsonify({'message': 'Invalid credentials'}), 401
+    
+    token = jwt.encode({
+        'user_id': user.id,
+        'exp': datetime.utcnow() + timedelta(hours=1)
+    }, app.config['SECRET_KEY'])
+    
+    return jsonify({'token': token})
+
+@app.route('/api/portfolios', methods=['GET'])
+@token_required
+def get_portfolios(current_user):
+    portfolios = Portfolio.query.filter_by(user_id=current_user.id).all()
+    return jsonify([{
+        'id': p.id,
+        'name': p.name,
+        'created_at': p.created_at.isoformat()
+    } for p in portfolios])
+
+@app.route('/api/portfolios', methods=['POST'])
+@token_required
+def create_portfolio(current_user):
+    data = request.get_json()
+    new_portfolio = Portfolio(user_id=current_user.id, name=data['name'])
+    db.session.add(new_portfolio)
+    db.session.commit()
+    return jsonify({'message': 'Portfolio created', 'id': new_portfolio.id}), 201
+
+@app.route('/api/portfolios/<int:portfolio_id>/optimize', methods=['POST'])
+@token_required
+def optimize_portfolio(current_user, portfolio_id):
+    portfolio = Portfolio.query.filter_by(id=portfolio_id, user_id=current_user.id).first()
+    if not portfolio:
+        return jsonify({'message': 'Portfolio not found'}), 404
+    
+    data = request.get_json()
+    tickers = [asset.ticker for asset in portfolio.assets]
+    
+    if not tickers:
+        return jsonify({'message': 'No assets in portfolio'}), 400
+    
+    try:
+        optimizer.fetch_data(tickers, period=data.get('period', '1y'))
+        optimized_weights = optimizer.optimize_portfolio(target_return=data.get('target_return'))
+        
+        # Update portfolio with optimized weights
+        for asset, weight in zip(portfolio.assets, optimized_weights):
+            asset.weight = weight
+        db.session.commit()
+        
+        # Calculate performance metrics
+        returns, volatility = optimizer.calculate_portfolio_performance(optimized_weights)
+        sharpe_ratio = returns / volatility
+        
+        return jsonify({
+            'optimized_weights': {asset.ticker: weight for asset, weight in zip(portfolio.assets, optimized_weights)},
+            'expected_return': returns,
+            'expected_volatility': volatility,
+            'sharpe_ratio': sharpe_ratio
+        })
+    except Exception as e:
+        return jsonify({'message': str(e)}), 500
+
+@app.route('/api/portfolios/<int:portfolio_id>/assets', methods=['POST'])
+@token_required
+def add_asset(current_user, portfolio_id):
+    portfolio = Portfolio.query.filter_by(id=portfolio_id, user_id=current_user.id).first()
+    if not portfolio:
+        return jsonify({'message': 'Portfolio not found'}), 404
+    
+    data = request.get_json()
+    new_asset = PortfolioAsset(
+        portfolio_id=portfolio_id,
+        ticker=data['ticker'].upper(),
+        weight=data.get('weight', 1.0)  # Default weight
+    )
+    db.session.add(new_asset)
+    db.session.commit()
+    return jsonify({'message': 'Asset added to portfolio'}), 201
+
+@app.route('/api/portfolios/<int:portfolio_id>/performance', methods=['GET'])
+@token_required
+def get_portfolio_performance(current_user, portfolio_id):
+    portfolio = Portfolio.query.filter_by(id=portfolio_id, user_id=current_user.id).first()
+    if not portfolio:
+        return jsonify({'message': 'Portfolio not found'}), 404
+    
+    tickers = [asset.ticker for asset in portfolio.assets]
+    weights = np.array([asset.weight for asset in portfolio.assets])
+    
+    if not tickers:
+        return jsonify({'message': 'No assets in portfolio'}), 400
+    
+    try:
+        optimizer.fetch_data(tickers)
+        returns, volatility = optimizer.calculate_portfolio_performance(weights)
+        sharpe_ratio = returns / volatility
+        
+        return jsonify({
+            'expected_return': returns,
+            'expected_volatility': volatility,
+            'sharpe_ratio': sharpe_ratio,
+            'assets': {asset.ticker: asset.weight for asset in portfolio.assets}
+        })
+    except Exception as e:
+        return jsonify({'message': str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(debug=True)
